@@ -11,13 +11,15 @@ yt2tg makes a structured recap of a YouTube video and posts it to a Telegram cha
 - Go CLI `yt2tg` (already written): it reads video data, downloads the audio, cuts it into 10-minute mp3 chunks and uploads them.
 - Cloudflare service: a protected HTTP API, a Workflow, a D1 database, an R2 bucket, Workers AI and a Telegram post.
 - A Postman collection and a step-by-step upload procedure.
+- Manual fixes of the post text, and a temporary hide of a post.
 - Volume: approximately 5 videos per day. One video can be up to 5 hours long.
 
 **Out of scope for the MVP**
 
 - A web UI, user accounts, more than one API token.
 - Download of audio in the cloud (YouTube blocks datacenter IP addresses).
-- More than one Telegram channel, edits of posts after publication.
+- More than one Telegram channel.
+- A delete of a post. Telegram lets a bot delete a post only in the first 48 hours.
 
 **Writing rules for tasks (ASD-STE100)**
 
@@ -42,7 +44,7 @@ The Worker accepts the upload and starts a workflow. The workflow does each slow
 | --- | --- | --- |
 | CLI | Go 1.22+, `yt-dlp`, `ffmpeg`, `deno` | Reads title, description and duration, downloads audio, cuts 16 kHz mono mp3 chunks, uploads them |
 | HTTP API | Cloudflare Worker, Effect `HttpApi` | Checks the token, stores the rows and the chunks, starts the workflows |
-| Pipeline | Cloudflare Workflows: `VideoPipeline` | Transcribes, saves the SRT, makes the recap (call A), posts, cleans up |
+| Pipeline | Cloudflare Workflows: `VideoPipeline` | Transcribes, saves the SRT, makes the recap (call A), posts, cleans up. With `from: "recap"`, it starts at the recap and edits the post |
 | Segments job | Cloudflare Workflows: `TranscriptSegmentsJob` | Makes `transcriptSegments` (call B). A failure here does not stop the recap |
 | Database | D1 | Tables `videos`, `transcripts` and `recaps`, joined on the video id |
 | Audio storage | R2 | Chunks, kept for 1 day or less |
@@ -129,6 +131,10 @@ CREATE TABLE videos (
   attempt             INTEGER NOT NULL DEFAULT 1,       -- part of the workflow instance id
   chunk_count         INTEGER,
   telegram_message_id INTEGER,
+  telegram_text       TEXT,                             -- HTML text of the post; you can edit it by hand
+  telegram_visibility TEXT NOT NULL DEFAULT 'visible'
+    CHECK (telegram_visibility IN ('visible','hidden')),
+  published_at        TEXT,                             -- time of the last send or edit in Telegram
   error               TEXT,
   created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
@@ -171,8 +177,8 @@ END;
 | --- | --- | --- |
 | `uploading` | `POST /videos` | The row exists. The chunks are not all in R2. |
 | `transcribing` | `POST /videos/:id/complete` | `VideoPipeline` started. Whisper runs on each chunk. |
-| `recapping` | `VideoPipeline` | The SRT is in `transcripts`. Call A makes the recap. |
-| `publishing` | `VideoPipeline` | The recap is in `recaps`. The service sends the Telegram post. |
+| `recapping` | `VideoPipeline` or `POST /videos/:id/recap/regenerate` | The SRT is in `transcripts`. Call A makes the recap. |
+| `publishing` | `VideoPipeline` | The recap is in `recaps`. The service sends the Telegram post, or edits it after a regeneration. |
 | `done` | `VideoPipeline` | The post is in the channel. `telegram_message_id` has a value. |
 | `failed` | `VideoPipeline` | A step failed after all retries. `error` has the cause. |
 
@@ -249,6 +255,7 @@ interface VideoRecap {
 | All recap fields except `transcriptSegments` | `recaps.recap` |
 | User choices (`featured`, `hidden`, `hiddenSections`) | `recaps.recap`, in place |
 | `transcriptSegments` | `recaps.transcript_segments` |
+| Telegram post: id, HTML text, visibility, time of the last change | `videos.telegram_message_id`, `telegram_text`, `telegram_visibility`, `published_at` |
 
 Size check: a 2-hour SRT is approximately 0.25 MB and its `transcript_segments` approximately 0.3 MB. Each is in a different column, and both are far below the D1 limit of 2 MB for one row.
 
@@ -390,9 +397,67 @@ Call B cannot merge, change or summarize text, because it never returns text.
 
 The post is the only display in the MVP. It has, in this sequence: the title and the channel, `summary`, `keyTakeaways`, `chapters` with deep links, and `hashtags` on the last line, each with `#` before it (for example `#db #indexing`). The post does not show a section that is in `hiddenSections` or that is empty. The post has 4096 characters or fewer. To make it shorter, remove chapters from the end, then takeaways from the end.
 
+The service saves the HTML text of the post in `videos.telegram_text`. After the first post, this column is the source of the post text. You can change it by hand (see "Post control").
+
+**Recap regeneration**
+
+Use a regeneration after you change the prompt, `RECAP_MODEL` or `HASHTAG_ALIASES`. It makes the recap again from the saved SRT. It does not download or transcribe the audio again.
+
+1. `POST /videos/:id/recap/regenerate` sets the status `recapping` and starts `VideoPipeline` with `from: "recap"`.
+2. The pipeline skips the transcribe tasks and `save-transcript`. It reads the cues from `transcripts`.
+3. It runs `known-hashtags`, call A, the checks and `save-recap` as in a full run. `recaps.model` and `recaps.prompt_version` get the current values.
+4. The publish task makes the post text again and saves it in `telegram_text`.
+5. If `telegram_message_id` has a value, the publish task edits that post with `editMessageText`. Else it sends a new post. If `telegram_visibility` is `hidden`, it does not change the post in Telegram.
+6. It starts `TranscriptSegmentsJob` again, because call B uses `mentions.people` from the new recap.
+
+WARNING: A regeneration replaces `telegram_text`. Your manual changes to the post text are lost.
+
+User choices: the new recap keeps `hiddenSections` from the old recap. The quotes and stats are new, so `featured` and `hidden` go back to their defaults.
+
+Telegram errors on an edit:
+
+- "message is not modified": the post already has this text. Accept it as a success.
+- "message to edit not found": a person deleted the post. Send a new post and save its `message_id`.
+
+NOTE: If a regeneration fails, the status is `failed` and the old post stays. `recaps` can already have the new recap. Send the regeneration request again. Do not upload the audio again.
+
+**Post control**
+
+Two endpoints change a post that is already in the channel. Both call Telegram directly in the request, because each one makes one Telegram call.
+
+- `POST /videos/:id/post/sync` edits the post to the current `telegram_text`. Use it after you change the text by hand.
+- `PUT /videos/:id/post/visibility` hides or shows the post.
+
+Telegram has no "hide" for a channel post, and a bot can delete a post only in the first 48 hours. Thus "hidden" is an edit:
+
+- `hidden`: the service edits the post to a placeholder: the title in bold, then the line "This recap is hidden for a short time." The placeholder has no hashtags, so a search by tag does not find it.
+- `visible`: the service edits the post back to `telegram_text`.
+- The post keeps its `message_id`, its links and its place in the channel. `telegram_text` does not change.
+
+Telegram errors in these two endpoints:
+
+| Telegram response | Service action |
+| --- | --- |
+| "message is not modified" | Accept it as a success. |
+| "message to edit not found" (a person deleted the post) | For `sync` and `visible`: send a new post and save its `message_id`. For `hidden`: make no Telegram call. |
+| Other `400`, for example "can't parse entities" | Return `422 PostRejected` with the Telegram `description`. Do not change the database. |
+| `429` | Return `429 TelegramRateLimited` with the header `Retry-After` from `parameters.retry_after`. |
+| Other errors | Return `502 TelegramUnavailable`. |
+
+**Fix the post text by hand**
+
+1. Read the current text: send `GET /videos/:id?include=post`, or open the `videos` table in the dashboard.
+2. If the post must not show while you work, send `PUT /videos/:id/post/visibility` with `{ "visibility": "hidden" }`.
+3. In the Cloudflare dashboard, go to **D1 SQL database**, select the database, then select **Tables** and the table `videos`.
+4. Find the row of the video and change `telegram_text`.
+5. If the dashboard does not let you edit the cell, select **Console** and run `UPDATE videos SET telegram_text = '<new text>' WHERE id = '<id>';`.
+6. Send `POST /videos/:id/post/sync`. If the post is hidden, send `PUT /videos/:id/post/visibility` with `{ "visibility": "visible" }` instead.
+
+WARNING: In the SQL text, write each `'` as `''`. In the post text, write `&`, `<` and `>` that are not part of a tag as `&amp;`, `&lt;` and `&gt;`. Use only the tags that Telegram HTML allows, for example `<b>`, `<i>`, `<a href="…">` and `<code>`.
+
 ## API contract and security
 
-The API has five endpoints, and each one requires the header `Authorization: Bearer <API_TOKEN>`. The Go CLI already uses the first three. The new optional fields do not break the CLI.
+The API has nine endpoints, and each one requires the header `Authorization: Bearer <API_TOKEN>`. The Go CLI already uses the first three. The new optional fields do not break the CLI.
 
 | Method and path | Request body | Success | Errors |
 | --- | --- | --- | --- |
@@ -401,6 +466,10 @@ The API has five endpoints, and each one requires the header `Authorization: Bea
 | `POST /videos/:id/complete` | JSON: `chunk_count` | `202 {id, status}` | `400`, `401`, `404`, `409` |
 | `GET /videos/:id` | none | `200`, see below | `401`, `404` |
 | `POST /videos/:id/segments/retry` | none | `202 {id, segments_status}` | `401`, `404`, `409` |
+| `GET /videos/:id/transcript.srt` | none | `200`, the SRT as a file | `401`, `404` |
+| `POST /videos/:id/recap/regenerate` | none | `202 {id, status}` | `401`, `404`, `409` |
+| `POST /videos/:id/post/sync` | none | `200 {id, telegram_visibility, published_at}` | `401`, `404`, `409`, `422`, `429`, `502` |
+| `PUT /videos/:id/post/visibility` | JSON: `visibility`, `"visible"` or `"hidden"` | `200 {id, telegram_visibility, published_at}` | `400`, `401`, `404`, `409`, `422`, `429`, `502` |
 
 **`POST /videos` body**
 
@@ -425,12 +494,13 @@ The API has five endpoints, and each one requires the header `Authorization: Bea
   "status": "done",
   "transcript": { "language": "uk", "cue_count": 812 },
   "recap": { "summary": "…", "keyTakeaways": [], "topics": [], "hashtags": [], "chapters": [], "quotes": [], "stats": [], "mentions": {} },
-  "segments_status": "idle"
+  "segments_status": "idle",
+  "post": { "message_id": 42, "visibility": "visible", "published_at": "2026-11-08T12:00:00.000Z" }
 }
 ```
 
-- `transcript` and `recap` are `null` until they exist.
-- Add `?include=srt` to get `transcript.srt`. Add `?include=segments` to get `recap.transcriptSegments`. You can use both: `?include=srt,segments`.
+- `transcript`, `recap` and `post` are `null` until they exist.
+- Add `?include=srt` to get `transcript.srt`. Add `?include=segments` to get `recap.transcriptSegments`. Add `?include=post` to get `post.text`. You can use more than one: `?include=srt,segments,post`.
 
 **Rules for each endpoint**
 
@@ -438,7 +508,13 @@ The API has five endpoints, and each one requires the header `Authorization: Bea
 - `PUT /videos/:id/chunks/:n`: Accept `n` from 0 to 99. Accept a body from 1 byte to 25 MB. Accept this request only when status is `uploading`. A second `PUT` of the same `n` replaces the object.
 - `POST /videos/:id/complete`: Make sure that R2 has the objects `000` to `chunk_count - 1`. If one is missing, return `409` with the list of missing numbers. Then set status to `transcribing` and start `VideoPipeline` with the instance id `<id>-<attempt>`.
 - `POST /videos/:id/segments/retry`: Return `409` if the recap does not exist or `segments_status` is `updating`. Else set `segments_status` to `updating` and start `TranscriptSegmentsJob` with the instance id `<id>-segments-<unix ms>`.
+- `GET /videos/:id/transcript.srt`: Read `transcripts.srt` from D1 on each request. Return it with `Content-Type: application/x-subrip; charset=utf-8` and `Content-Disposition: attachment; filename="<youtube_id>.srt"`. Return `404` if the video or the transcript does not exist.
+- `POST /videos/:id/recap/regenerate`: Return `409` if the transcript does not exist, the status is not `done` or `failed`, or `segments_status` is `updating`. Else set status to `recapping`, clear `error`, and start `VideoPipeline` with the instance id `<id>-recap-<unix ms>` and `from: "recap"`.
+- `POST /videos/:id/post/sync`: Return `409` if the status is not `done` or `failed`, the video has no post, or `telegram_visibility` is `hidden`. Else edit the post to `telegram_text` and set `published_at`.
+- `PUT /videos/:id/post/visibility`: Return `409` if the status is not `done` or `failed`, or the video has no post. If the value is the current value, do nothing and return `200`. Else edit the post (see "Post control"), then save `telegram_visibility` and `published_at`.
 - All errors: return JSON `{ "error": "<tag>", "message": "<text>" }`.
+
+NOTE: The service does not store the SRT file in R2 and does not cache the download. The SRT changes only after a new transcription, and one D1 read is cheap at this volume.
 
 **Security**
 
@@ -532,9 +608,32 @@ NOTE: If a `PUT` fails, send the same request again. The service replaces the ol
 1. Make a request. Set the method to `GET` and the URL to `{{baseUrl}}/videos/{{videoId}}`.
 2. Select **Send** each minute. The `status` field changes from `transcribing` to `recapping` to `publishing` to `done`.
 3. When the status is `done`, open the Telegram channel. Make sure that the post is there.
-4. If the status is `failed`, read the `error` field. To try again, do part C again, then parts D and E.
+4. If the status is `failed`, read the `error` field. If `transcript` has a value, do part H. Else do part C again, then parts D and E.
 
 NOTE: The response field `segments_status` changes separately from `status`. If it is `failed`, the recap is still correct. To make the transcript segments again, send `POST {{baseUrl}}/videos/{{videoId}}/segments/retry` with no body. Make sure that the status is `202 Accepted`.
+
+**G. Download the SRT (optional)**
+
+1. Make a request. Set the method to `GET` and the URL to `{{baseUrl}}/videos/{{videoId}}/transcript.srt`.
+2. Open the menu on the **Send** button and select **Send and Download**.
+3. Save the file. Its name is `<youtube id>.srt`.
+
+**H. Regenerate the recap (optional)**
+
+Do this part after you change the prompt, `RECAP_MODEL` or `HASHTAG_ALIASES` and deploy again.
+
+1. Make a request. Set the method to `POST` and the URL to `{{baseUrl}}/videos/{{videoId}}/recap/regenerate`. Do not add a body.
+2. Select **Send**. Make sure that the status is `202 Accepted`.
+3. Do part F. The `status` field changes from `recapping` to `publishing` to `done`.
+4. Open the Telegram channel. Make sure that the old post shows the new recap.
+
+**I. Hide, show or fix a post (optional)**
+
+1. To hide the post, make a request with the method `PUT` and the URL `{{baseUrl}}/videos/{{videoId}}/post/visibility`.
+2. On the **Body** tab, select **raw** and **JSON**. Type `{ "visibility": "hidden" }`. Select **Send**.
+3. Make sure that the status is `200 OK` and that the channel shows the placeholder.
+4. To show the post again, send the same request with `{ "visibility": "visible" }`.
+5. To fix the text, do the steps in "Fix the post text by hand". Then send `POST {{baseUrl}}/videos/{{videoId}}/post/sync` with no body.
 
 **If you get an error**
 
@@ -543,12 +642,17 @@ NOTE: The response field `segments_status` changes separately from `status`. If 
 | `401` | The token is missing or incorrect. | Examine the collection **Authorization** tab and the `token` variable. |
 | `404` | `videoId` is empty or incorrect. | Send the part C request again. |
 | `409` on `PUT` | The status is not `uploading`. | Send `GET`. Do part C again if the status is `failed`. |
+| `404` on `transcript.srt` | The transcript does not exist yet. | Wait until the status is `recapping` or later. |
+| `409` on `regenerate` | The pipeline runs, call B runs, or the transcript does not exist. | Wait until `status` is `done` and `segments_status` is not `updating`. Then send again. |
+| `409` on `post/sync` | The post is hidden, the video has no post, or the pipeline runs. | Show the post with `post/visibility`, or wait until the status is `done`. |
+| `422` on `post/sync` or `post/visibility` | Telegram does not accept `telegram_text`. | Read `message`. Correct the HTML in `telegram_text`, then send again. |
+| `429` | Telegram limits the requests. | Wait for the seconds in `Retry-After`, then send again. |
 | `413` | The file is larger than 25 MB. | Make the chunks again with `-chunk 5m`. |
 | `415` | The `Content-Type` header is incorrect. | Set it to `audio/mpeg`. |
 
 ## Tasks
 
-The MVP has 34 tasks in 6 phases. Each task is small enough for one pull request. Do the tasks in the sequence of their numbers, unless "Needs" gives a different sequence. Each task has steps and a result. A task is complete only when all items in "Result" are true.
+The MVP has 38 tasks in 6 phases. Each task is small enough for one pull request. Do the tasks in the sequence of their numbers, unless "Needs" gives a different sequence. Tasks T35 to T38 were added later: their place in the list shows their phase, and "Needs" shows their sequence. Each task has steps and a result. A task is complete only when all items in "Result" are true.
 
 ### Phase 0: Repository
 
@@ -589,7 +693,7 @@ The MVP has 34 tasks in 6 phases. Each task is small enough for one pull request
   1. Make `migrations/0001_init.sql` with the SQL in "Data model".
   2. Deploy.
 
-  Result: `wrangler d1 execute <db> --remote --command "PRAGMA table_info(videos)"` shows 16 columns, and the tables transcripts and recaps exist. A second deploy does not apply the migration again.
+  Result: `wrangler d1 execute <db> --remote --command "PRAGMA table_info(videos)"` shows 19 columns, and the tables transcripts and recaps exist. A second deploy does not apply the migration again.
 - [ ] **T06. Add an expiry rule to the R2 bucket.** Needs: T04.
   1. Find the lifecycle option in the Alchemy R2 `Bucket` API reference.
   2. If the option exists, set a rule: delete objects with the prefix `audio/` after 1 day.
@@ -628,12 +732,13 @@ The MVP has 34 tasks in 6 phases. Each task is small enough for one pull request
   Result: Tests cover an exact quote, a quote across two cues, a Cyrillic quote, a quote with changed words, a correct stat and an invented stat.
 - [ ] **T10. Write the D1 repositories.** Needs: T05, T07.
   1. Make `VideoRepo`, `TranscriptRepo` and `RecapRepo` as Effect services. Use `Cloudflare.D1.QueryDatabase(Database)` or `SQL.D1` from `@alchemy.run/cloudflare/D1/SQL`.
-  2. In `VideoRepo`, add `insert`, `findById`, `findByYoutubeId`, `setStatus`, `resetForRetry`, `markPublished` and `markFailed`.
-  3. In `TranscriptRepo`, add `save` and `find`. `save` replaces an existing row.
-  4. In `RecapRepo`, add `save`, `find`, `setSegmentsStatus`, `saveSegments` and `topHashtags(limit, excludeVideoId)`. `save` replaces an existing row.
-  5. Make `topHashtags` use the query in "Known hashtags".
-  6. Use bound parameters in all queries. Do not put values into SQL text.
-  7. Return a typed `VideoNotFound` error when a row does not exist.
+  2. In `VideoRepo`, add `insert`, `findById`, `findByYoutubeId`, `setStatus`, `resetForRetry`, `markPublished`, `setPostText`, `setVisibility` and `markFailed`.
+  3. Make `markPublished` save `telegram_message_id`, `telegram_text` and `published_at` together.
+  4. In `TranscriptRepo`, add `save` and `find`. `save` replaces an existing row.
+  5. In `RecapRepo`, add `save`, `find`, `setSegmentsStatus`, `saveSegments` and `topHashtags(limit, excludeVideoId)`. `save` replaces an existing row.
+  6. Make `topHashtags` use the query in "Known hashtags".
+  7. Use bound parameters in all queries. Do not put values into SQL text.
+  8. Return a typed `VideoNotFound` error when a row does not exist.
 
   Result: Each function has a test against local D1. A delete of a `videos` row also deletes its `transcripts` and `recaps` rows. `topHashtags` sorts the tags by use count, does not count the excluded video and gives an empty list when `recaps` is empty.
 - [ ] **T11. Write the `AudioStore` service.** Needs: T04.
@@ -646,11 +751,11 @@ The MVP has 34 tasks in 6 phases. Each task is small enough for one pull request
 ### Phase 3: HTTP API
 
 - [ ] **T12. Define the HTTP API.** Needs: T07.
-  1. In `src/api/Errors.ts`, write tagged errors: `BadRequest` (400), `Unauthorized` (401), `VideoNotFound` (404), `Conflict` (409), `PayloadTooLarge` (413), `UnsupportedMediaType` (415).
-  2. In `src/api/Api.ts`, write `VideosGroup` with the five endpoints in "API contract".
+  1. In `src/api/Errors.ts`, write tagged errors: `BadRequest` (400), `Unauthorized` (401), `VideoNotFound` (404), `TranscriptNotFound` (404), `Conflict` (409), `PayloadTooLarge` (413), `UnsupportedMediaType` (415), `PostRejected` (422), `TelegramRateLimited` (429), `TelegramUnavailable` (502).
+  2. In `src/api/Api.ts`, write `VideosGroup` with the nine endpoints in "API contract".
   3. Add `VideosGroup` to `YtApi` with `HttpApi.make`.
 
-  Result: `bun run typecheck` passes. The five endpoints show in the generated OpenAPI document.
+  Result: `bun run typecheck` passes. The nine endpoints show in the generated OpenAPI document.
 - [ ] **T13. Protect the API with a bearer token.** Needs: T12.
   1. In `src/api/Auth.ts`, write a `HttpApiMiddleware` with `HttpApiSecurity.bearer`.
   2. Read the token with `Config.Redacted("API_TOKEN")` in the Worker construction phase.
@@ -682,14 +787,14 @@ The MVP has 34 tasks in 6 phases. Each task is small enough for one pull request
   2. Check that the status is `uploading`. Else return `409`.
   3. List the chunks. If a number from 0 to `chunk_count - 1` is missing, return `409` with the missing numbers.
   4. Set `chunk_count` and the status `transcribing`.
-  5. Start `VideoPipeline` with `create({ id: "<id>-<attempt>", params: { videoId } })`.
+  5. Start `VideoPipeline` with `create({ id: "<id>-<attempt>", params: { videoId, runId: "<id>-<attempt>" } })`.
   6. Return `202 {id, status}`.
 
   Result: With all chunks, the workflow instance starts. With one chunk missing, the response names it, and the status stays `uploading`.
 - [ ] **T17. Write the `GET /videos/:id` handler.** Needs: T14.
   1. Read `videos`, `transcripts` and `recaps` in one query with two `LEFT JOIN` clauses on the video id.
   2. Return the response in "`GET /videos/:id` response". Return `transcript` and `recap` as `null` when they do not exist.
-  3. Add `transcript.srt` only for `include=srt`. Add `recap.transcriptSegments` only for `include=segments`.
+  3. Add `transcript.srt` only for `include=srt`. Add `recap.transcriptSegments` only for `include=segments`. Add `post.text` only for `include=post`.
   4. Return `recap` as a JSON object, not as a string.
 
   Result: Tests cover a video with no recap, a video with a recap, and each `include` value. An unknown id gives `404`.
@@ -701,11 +806,19 @@ The MVP has 34 tasks in 6 phases. Each task is small enough for one pull request
   5. Return `202 {id, segments_status}`.
 
   Result: A retry after a failed call B makes `transcript_segments` and sets `segments_status` to `idle`. A second retry during `updating` gives `409`.
+- [ ] **T35. Write the SRT download handler.** Needs: T17.
+  1. Declare the success response of `GET /videos/:id/transcript.srt` as text with the type `application/x-subrip; charset=utf-8`.
+  2. Read `transcripts.srt` with `TranscriptRepo.find` on each request.
+  3. Return `VideoNotFound` or `TranscriptNotFound` when the row does not exist.
+  4. Add the header `Content-Disposition: attachment; filename="<youtube_id>.srt"`.
+  5. Do not store the file in R2. Do not cache the response.
+
+  Result: `curl -OJ` with the token saves `<youtube_id>.srt`, and its text is equal to `transcripts.srt`. A video with no transcript gives `404`.
 
 ### Phase 4: Workflow
 
 - [ ] **T19. Write the `VideoPipeline` frame.** Needs: T10, T11.
-  1. In `src/workflow.ts`, write `VideoPipeline` with `Cloudflare.Workflow<VideoPipeline>()("VideoPipeline", …)`. Its input is `{ videoId }`.
+  1. In `src/workflow.ts`, write `VideoPipeline` with `Cloudflare.Workflow<VideoPipeline>()("VideoPipeline", …)`. Its input is `{ videoId, runId }`, where `runId` is the instance id.
   2. Put all I/O in `Cloudflare.Workflows.task("<name>", effect, { retries })`. Give each task a stable name.
   3. Write one task for each status change. The sequence is `transcribing`, `recapping`, `publishing`, `done`.
   4. Catch the final error outside the tasks. In a task with the name `mark-failed`, call `markFailed` with the error tag and message.
@@ -783,7 +896,7 @@ The MVP has 34 tasks in 6 phases. Each task is small enough for one pull request
   5. Escape `&`, `<` and `>` in all text from YouTube and from the model.
   6. Make sure that the post has 4096 characters or fewer. Remove chapters from the end, then takeaways from the end. Do not cut inside an HTML tag.
   7. Send it with `sendMessage` and `parse_mode: "HTML"`. If Telegram returns `429`, wait for `parameters.retry_after` seconds and try again.
-  8. Save `message_id` with `markPublished`.
+  8. Save `message_id` and the post text with `markPublished`.
 
   WARNING: Do not log the bot token. The token is part of the Telegram API URL.
 
@@ -791,7 +904,8 @@ The MVP has 34 tasks in 6 phases. Each task is small enough for one pull request
 - [ ] **T27. Write the last pipeline tasks.** Needs: T25, T26.
   1. Write a task with the name `cleanup`. It calls `AudioStore.deleteAll(videoId)`.
   2. Set the status to `done` after the cleanup.
-  3. Write a task with the name `start-segments`. It starts `TranscriptSegmentsJob` with the instance id `<id>-segments-<attempt>`.
+  3. Write a task with the name `start-segments`. It starts `TranscriptSegmentsJob` with the instance id `<runId>-segments`.
+  4. In `start-segments`, set `segments_status` to `updating` before you start the job.
 
   Result: After a full run, R2 has no objects under `audio/<videoId>/`. The status is `done`, and `segments_status` goes to `idle` with segments.
 - [ ] **T28. Make the recap test set.** Needs: T24.
@@ -803,6 +917,43 @@ The MVP has 34 tasks in 6 phases. Each task is small enough for one pull request
   6. Make the script print the removed items, so that you can examine them.
 
   Result: The script passes for all three fixtures. Fewer than 20% of quotes and stats are removed by the checks.
+- [ ] **T36. Add the recap mode to `VideoPipeline`.** Needs: T27.
+  1. Add the optional field `from` to the `VideoPipeline` input. Its values are `"start"` (the default) and `"recap"`.
+  2. When `from` is `"recap"`, skip the `transcribe-<n>` tasks and `save-transcript`.
+  3. Make the recap tasks read the cues from `TranscriptRepo` in both modes.
+  4. In `save-recap`, copy `hiddenSections` from the old recap into the new recap.
+  5. In the publish task, make the post text and save it with `setPostText`.
+  6. If `telegram_visibility` is `hidden`, do not call Telegram. Go to the next task.
+  7. Else call `editMessageText` with `parse_mode: "HTML"` when `telegram_message_id` has a value. Else call `sendMessage`.
+  8. Accept the Telegram error "message is not modified" as a success.
+  9. On the Telegram error "message to edit not found", send a new post and save its `message_id`.
+  10. Run `cleanup` and `start-segments` as in a full run.
+
+  Result: A regeneration of a `done` video runs no transcribe task. It updates `recaps.model` and `recaps.prompt_version` and keeps `hiddenSections`. The test post changes, and `telegram_message_id` stays the same. After a deletion of the test post, a regeneration sends a new post and saves the new `message_id`. A regeneration of a hidden post changes `telegram_text`, and the channel still shows the placeholder.
+- [ ] **T37. Write the `recap/regenerate` handler.** Needs: T18, T36.
+  1. Return `404` if the video does not exist.
+  2. Return `409` if the transcript does not exist.
+  3. Return `409` if the status is not `done` or `failed`, or `segments_status` is `updating`.
+  4. Set the status `recapping` and clear `error`.
+  5. Start `VideoPipeline` with the instance id `<id>-recap-<unix ms>`.
+  6. Give it the params `{ videoId, runId: "<id>-recap-<unix ms>", from: "recap" }`.
+  7. Return `202 {id, status}`.
+
+  Result: A request for a `done` video returns `202`, and the status goes back to `done` with a new recap. A second request during `recapping` gives `409`. A request for a video with status `uploading` gives `409`.
+- [ ] **T38. Write the post control handlers.** Needs: T36.
+  1. In `src/lib/telegramFormat.ts`, write `hiddenPostText(video)`. It gives the title in bold and the line "This recap is hidden for a short time."
+  2. In the `Telegram` service, add `editPost(messageId, text)`. Map the Telegram errors as in "Post control".
+  3. Write the `POST /videos/:id/post/sync` handler. Apply the `409` rules in "Rules for each endpoint".
+  4. In `sync`, edit the post to `telegram_text`. Then set `published_at`.
+  5. Write the `PUT /videos/:id/post/visibility` handler. Decode the body with `Schema.Literal("visible", "hidden")`.
+  6. If the value is the current value, return `200` with no Telegram call.
+  7. For `hidden`, edit the post to `hiddenPostText`. For `visible`, edit the post to `telegram_text`.
+  8. Save `telegram_visibility` and `published_at` only after Telegram accepts the edit.
+  9. On "message to edit not found", follow the table in "Post control".
+
+  WARNING: Do not put the bot token in an error message. The Telegram `description` is safe to return.
+
+  Result: Tests with a fake Telegram cover a sync, a hide, a show, a second hide with no Telegram call, a `422`, a `429` with `Retry-After` and a deleted post. A test in the test channel shows the placeholder after a hide and the full post after a show.
 
 ### Phase 5: CLI
 
@@ -825,22 +976,27 @@ The MVP has 34 tasks in 6 phases. Each task is small enough for one pull request
 
 ### Phase 6: Delivery
 
-- [ ] **T31. Make the Postman collection.** Needs: T18.
-  1. Make the collection and the environment as in "Postman procedure", parts B to F.
+- [ ] **T31. Make the Postman collection.** Needs: T18, T35, T37, T38.
+  1. Make the collection and the environment as in "Postman procedure", parts B to I.
   2. Add the post-response script that sets `videoId`.
   3. Add the request `POST {{baseUrl}}/videos/{{videoId}}/segments/retry`.
-  4. Export the collection to `postman/yt2tg.postman_collection.json`.
-  5. Make sure that the exported file has no token value.
+  4. Add the requests `GET {{baseUrl}}/videos/{{videoId}}/transcript.srt` and `POST {{baseUrl}}/videos/{{videoId}}/recap/regenerate`.
+  5. Add the requests `POST {{baseUrl}}/videos/{{videoId}}/post/sync` and `PUT {{baseUrl}}/videos/{{videoId}}/post/visibility`.
+  6. Export the collection to `postman/yt2tg.postman_collection.json`.
+  7. Make sure that the exported file has no token value.
 
   Result: A new Postman workspace can import the file and do the procedure.
-- [ ] **T32. Write the integration test.** Needs: T27.
+- [ ] **T32. Write the integration test.** Needs: T35, T37, T38.
   1. Start the local service with `bun run dev`.
   2. Use a 90-second test mp3 in `service/test/fixtures/`. Make it with `ffmpeg` from text-to-speech audio with two named speakers.
   3. Send the requests in sequence, with `speakers` set. Use a Telegram test channel.
   4. Wait until the status is `done` or `failed`. The time limit is 5 minutes.
   5. Wait until `segments_status` is `idle` with segments, or `failed`.
+  6. Send `GET /videos/:id/transcript.srt`.
+  7. Send `POST /videos/:id/recap/regenerate`. Wait until the status is `done` again.
+  8. Hide the post, change `telegram_text` in local D1, show the post, then send `post/sync`.
 
-  Result: `bun test` passes. The test channel has one new post. `GET ?include=segments` returns segments.
+  Result: `bun test` passes. The test channel has one new post, and the regeneration edits it. After the show, the post has the changed text. `GET ?include=segments` returns segments. The SRT download is equal to `transcripts.srt`.
 - [ ] **T33. Deploy to production.** Needs: T28, T30, T31, T32.
   1. Run `bunx alchemy deploy --stage prod`.
   2. Do the Postman procedure with one short video.
@@ -854,6 +1010,8 @@ The MVP has 34 tasks in 6 phases. Each task is small enough for one pull request
   3. Add a link to the Postman procedure.
   4. Write how to change the API token, `RECAP_MODEL` and `SEGMENTS_MODEL`.
   5. Write how to add an entry to `HASHTAG_ALIASES`.
+  6. Write how to regenerate the recaps after a change of the prompt or `RECAP_MODEL`.
+  7. Add a link to "Fix the post text by hand".
 
   Result: A person with no knowledge of the project can deploy it and post one video.
 
@@ -877,11 +1035,13 @@ On your computer, the CLI reads `YT2TG_API_URL` (the Worker URL) and `YT2TG_TOKE
 
 - [ ] How is a transcript handled when it is longer than the model context? The spec has a proposal: one pass up to 60,000 estimated tokens, else map and reduce. Confirm the limits after T28.
 - [ ] Where are the user-set fields (`featured`, `hidden`, `hiddenSections`) stored and edited? The spec stores them in `recaps.recap`. No endpoint or UI edits them in the MVP.
-- [ ] Are recaps made again when the transcript changes? If they are, are the user choices kept?
+- [ ] Must the service make a recap again automatically when the transcript changes? In the MVP, only `POST /videos/:id/recap/regenerate` does this. It keeps `hiddenSections` and sets `featured` and `hidden` to their defaults.
+- [ ] Must a regeneration keep manual changes to `telegram_text`? Now it replaces them. A column such as `telegram_text_edited` could make a regeneration stop with `409`.
+- [ ] Must a regeneration of many videos be possible in one request, for example after a change of `RECAP_MODEL`? The MVP regenerates one video for each request.
 - [ ] Which Workers AI model to use for `RECAP_MODEL`? The default is `gpt-oss-120b`. It is not on the JSON mode list, so the spec decodes and checks its output in code.
 - [ ] Does the Alchemy R2 `Bucket` have a lifecycle option (T06)?
-- [ ] Is a `POST /videos/:id/retry` endpoint necessary, or is the `failed` reset in `POST /videos` sufficient?
-- [ ] Must the Telegram post show quotes, stats or mentions? When a user sets `featured` later, must the post change with `editMessageText`?
+- [ ] Is a `POST /videos/:id/retry` endpoint necessary? Now the `failed` reset in `POST /videos` repeats the full run, and `recap/regenerate` repeats the run from the recap.
+- [ ] Must the Telegram post show quotes, stats or mentions? When a user sets `featured` later, must the post change? The publish task can already edit a post (T36).
 - [ ] `quotes[].translation` is an addition to the given recap shape. Keep it, or use a different field?
 - [ ] Must the first chapter start at 0 and the last chapter end at `duration_sec`? T28 checks this now.
 - [ ] Which language is the transcript language when a video has more than one language? T21 uses the language of most chunks.
@@ -901,3 +1061,6 @@ On your computer, the CLI reads `YT2TG_API_URL` (the Worker URL) and `YT2TG_TOKE
 - [Cloudflare: whisper-large-v3-turbo](https://developers.cloudflare.com/workers-ai/models/whisper-large-v3-turbo)
 - [gpt-oss-120b on Workers AI: context and price listing](https://pi.dev/models/cloudflare-ai-gateway/workers-ai-cf-openai-gpt-oss-120b)
 - [Cloudflare: D1 limits](https://developers.cloudflare.com/d1/platform/limits/)
+- [Telegram Bot API: editMessageText](https://core.telegram.org/bots/api#editmessagetext)
+- [Telegram Bot API: deleteMessage limits](https://core.telegram.org/bots/api#deletemessage)
+- [Cloudflare: D1 dashboard console and tables](https://developers.cloudflare.com/d1/get-started/)
