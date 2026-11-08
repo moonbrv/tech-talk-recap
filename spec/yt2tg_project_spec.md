@@ -96,6 +96,7 @@ yt2tg/
 │   │       ├── timestamps.ts      # parse loose timestamps, format, deep links
 │   │       ├── grounding.ts       # quote and stat checks against the transcript
 │   │       ├── prompts.ts         # prompt text and PROMPT_VERSION
+│   │       ├── hashtags.ts        # HASHTAG_ALIASES, normalizeHashtags
 │   │       ├── telegramFormat.ts  # HTML post, escape, 4096 limit
 │   │       └── uuidv7.ts
 │   └── test/
@@ -185,13 +186,14 @@ All times are integer seconds from the start of the video. The service uses thes
 type Seconds = number;
 
 type RecapSectionKey =
-  | 'summary' | 'keyTakeaways' | 'topics' | 'chapters'
+  | 'summary' | 'keyTakeaways' | 'topics' | 'hashtags' | 'chapters'
   | 'quotes' | 'stats' | 'mentions' | 'transcript';
 
 interface VideoRecap {
   summary: string;
   keyTakeaways: string[];
   topics: string[];
+  hashtags: string[];             // project addition, see below
   chapters: { title: string; startSec: Seconds; endSec: Seconds }[];
   quotes: {
     text: string;
@@ -223,6 +225,7 @@ interface VideoRecap {
 | `summary` | A short prose overview of the video: what it is about and what the viewer gets from it. 2–4 sentences. |
 | `keyTakeaways` | The main lessons, one sentence each. These are the "if you watch nothing else" points. |
 | `topics` | Short topic tags (for example "Postgres indexing" or "hiring"). Use them for filtering and search. |
+| `hashtags` | Up to 7 hashtags for the Telegram post, made from `topics` and `summary`. Users search for posts on similar topics with them. Each item is one lowercase word without `#`. Short forms are preferred: "database" gives `db`, "machine learning" gives `ml`, "database indexing" gives `db` and `indexing`. |
 | `chapters` | A time-coded outline of the video. Each chapter links to its start time in the video. |
 | `quotes` | Notable quotes, copied word for word from the transcript, with the speaker and start time. `featured` and `hidden` are set by the user, never by the model. |
 | `stats` | Numbers the speakers actually said (`value` is "40%", `description` is what that number measures). `hidden` is set by the user. |
@@ -235,7 +238,8 @@ interface VideoRecap {
 | Field | Rule |
 | --- | --- |
 | `quotes[].translation` | The English translation of `text`. It is `null` when the video is in English. `text` stays word for word in the language of the video. |
-| Language | All other recap text is in English: `summary`, `keyTakeaways`, `topics`, chapter titles, stat descriptions and `concepts`. Names in `people`, `companies` and `books` use their usual English spelling. `transcriptSegments[].text` stays in the language of the video. |
+| `hashtags` | Tags for the Telegram post. The Telegram post shows them in place of `topics`. See rule 8 in "Recap generation". |
+| Language | All other recap text is in English: `summary`, `keyTakeaways`, `topics`, `hashtags`, chapter titles, stat descriptions and `concepts`. Names in `people`, `companies` and `books` use their usual English spelling. `transcriptSegments[].text` stays in the language of the video. |
 
 **Where each part is stored**
 
@@ -266,6 +270,7 @@ Two model calls make the recap. Call A makes all fields except `transcriptSegmen
 5. **Speakers.** Whisper gives no speaker labels. Set `speaker` only when the transcript identifies who speaks. Give the model the title, the description and the optional `speakers` list as hints. Else set `speaker` to `null`. Never guess a speaker.
 6. **Deep links.** Show each time as `MM:SS` when the video is shorter than 1 hour, else as `HH:MM:SS`. Link it to `https://www.youtube.com/watch?v=<youtube_id>&t=<startSec>s`.
 7. **Language.** Write the recap in English for all input languages. Keep `quotes[].text` word for word in the language of the video, and put the English text in `quotes[].translation`. Keep the SRT and `transcriptSegments` in the language of the video.
+8. **Hashtags.** Make `hashtags` after `summary` and `topics`, from the content of these two fields. Give 7 tags or fewer. Make each tag one English word or one usual short form. Use the short form when one is usual: "database" gives `db`, "machine learning" gives `ml`. Split a topic of more than one word into separate tags: "database indexing" gives `db` and `indexing`. Use the same tag for the same idea in all videos, so that users can find similar posts. Give the model the short forms from `HASHTAG_ALIASES` and the 50 most used tags in the prompt (see "Known hashtags"). After generation, code replaces each known word with its short form (see "Hashtag aliases").
 
 **Call A: model output schema**
 
@@ -276,6 +281,7 @@ interface ModelRecapOutput {
   summary: string;            // English, 2-4 sentences
   keyTakeaways: string[];     // English, 3-7 items
   topics: string[];           // English, 3-8 short tags
+  hashtags: string[];         // English, 1-7 single words or short forms, from summary and topics, no "#"
   chapters: {
     title: string;            // English
     start: string;            // timestamp copied exactly from a transcript line
@@ -296,7 +302,7 @@ interface ModelRecapOutput {
 }
 ```
 
-The prompt asks for one chapter for each 5–10 minutes of video: 5–8 chapters for 45 minutes, 10–16 chapters for 2 hours. The prompt also has the title, the channel, the description, the `speakers` list, the transcript language and `duration_sec`.
+The prompt asks for one chapter for each 5–10 minutes of video: 5–8 chapters for 45 minutes, 10–16 chapters for 2 hours. The prompt also has the title, the channel, the description, the `speakers` list, the transcript language, `duration_sec` and the known hashtags.
 
 **Call A: input size**
 
@@ -307,7 +313,7 @@ The prompt asks for one chapter for each 5–10 minutes of video: 5–8 chapters
 
 - Estimate tokens as the number of characters divided by 3. This is a high estimate for English and for Cyrillic text.
 - Long path, map: cut the transcript lines into windows of 30,000 estimated tokens or fewer, at cue boundaries. Run call A on each window with the same schema. Each window gives candidate chapters, quotes, stats and mentions with timestamps copied from its lines.
-- Long path, reduce: one call gets the window outputs, not the transcript. It writes `summary`, `keyTakeaways` and `topics`, and it selects chapters, quotes and stats from the candidates. It copies the selected items without change.
+- Long path, reduce: one call gets the window outputs and the known hashtags, not the transcript. It writes `summary`, `keyTakeaways`, `topics` and `hashtags`, and it selects chapters, quotes and stats from the candidates. It copies the selected items without change.
 - Both paths go through the same checks below, so a long video has the same grounding as a short video.
 
 **Call A: checks after generation (code)**
@@ -320,6 +326,55 @@ The prompt asks for one chapter for each 5–10 minutes of video: 5–8 chapters
 6. Speakers: keep a speaker name only if it occurs in the hints or in the transcript text. Else set `null`.
 7. Topics and mentions: trim them, remove empty items, and remove duplicates without case.
 8. Set `translation` to `null` when the transcript language is `en`. Set `featured` to `false` on each quote.
+9. Hashtags: remove `#`, make each tag lowercase, and remove all characters that are not letters, digits or `_`. Replace each tag that is a key in `HASHTAG_ALIASES` with its value. Then remove empty tags, tags with no letter and duplicates. Keep the first 7 tags.
+
+**Hashtag aliases**
+
+`src/lib/hashtags.ts` has the constant map `HASHTAG_ALIASES`. It makes sure that one idea always gets the same tag, so that a search by tag finds all similar posts.
+
+- A key is a tag after the cleanup in check 9: lowercase, with `_` between words. A value is one tag.
+- Code applies the map after the cleanup and before the duplicate check. Thus `database` and `db` in one recap give one `db` tag.
+- The prompt gets the list of values, so that the model uses these short forms first.
+- When two posts use different tags for the same idea, add an entry to the map and deploy again.
+
+NOTE: A new entry changes only new posts. The service does not edit old posts.
+
+The first entries of the map:
+
+| Key | Value |
+| --- | --- |
+| `database`, `databases` | `db` |
+| `machine_learning`, `machinelearning` | `ml` |
+| `artificial_intelligence` | `ai` |
+| `large_language_model`, `large_language_models`, `llms` | `llm` |
+| `javascript` | `js` |
+| `typescript` | `ts` |
+| `kubernetes` | `k8s` |
+| `postgresql` | `postgres` |
+| `continuous_integration` | `ci` |
+| `user_experience` | `ux` |
+
+**Known hashtags**
+
+The alias map fixes only the words in the map. To make the model use tags that earlier posts use, the prompt also gets the 50 most used tags.
+
+- Before call A, a task with the name `known-hashtags` reads the tags from `recaps.recap` with this query:
+
+```sql
+SELECT j.value AS tag, COUNT(*) AS uses
+FROM recaps, json_each(recaps.recap, '$.hashtags') AS j
+WHERE recaps.video_id != ?1                    -- the current video, for a retry
+GROUP BY j.value
+ORDER BY uses DESC, tag ASC
+LIMIT 50;
+```
+
+- The user message of call A gets the list, with this instruction: "Use a tag from this list when it agrees with the video. Add a new tag only when no tag in the list agrees."
+- The list is a hint only. Never add a tag because it is in the list. Every tag must agree with `summary` and `topics`.
+- An empty list is correct, for example for the first video. Then the prompt has no list.
+- Check 9 applies to these tags too, so the list cannot bring back a word that has an alias.
+
+NOTE: The query reads all rows of `recaps`. At 5 videos each day, this is less than 2,000 rows each year, which is sufficiently fast.
 
 **Call B: speaker labels**
 
@@ -333,7 +388,7 @@ Call B cannot merge, change or summarize text, because it never returns text.
 
 **Telegram post**
 
-The post is the only display in the MVP. It has, in this sequence: the title and the channel, `summary`, `keyTakeaways`, `chapters` with deep links, and `topics` as hashtags. The post does not show a section that is in `hiddenSections` or that is empty. The post has 4096 characters or fewer. To make it shorter, remove chapters from the end, then takeaways from the end.
+The post is the only display in the MVP. It has, in this sequence: the title and the channel, `summary`, `keyTakeaways`, `chapters` with deep links, and `hashtags` on the last line, each with `#` before it (for example `#db #indexing`). The post does not show a section that is in `hiddenSections` or that is empty. The post has 4096 characters or fewer. To make it shorter, remove chapters from the end, then takeaways from the end.
 
 ## API contract and security
 
@@ -369,7 +424,7 @@ The API has five endpoints, and each one requires the header `Authorization: Bea
   "title": "…",
   "status": "done",
   "transcript": { "language": "uk", "cue_count": 812 },
-  "recap": { "summary": "…", "keyTakeaways": [], "topics": [], "chapters": [], "quotes": [], "stats": [], "mentions": {} },
+  "recap": { "summary": "…", "keyTakeaways": [], "topics": [], "hashtags": [], "chapters": [], "quotes": [], "stats": [], "mentions": {} },
   "segments_status": "idle"
 }
 ```
@@ -575,11 +630,12 @@ The MVP has 34 tasks in 6 phases. Each task is small enough for one pull request
   1. Make `VideoRepo`, `TranscriptRepo` and `RecapRepo` as Effect services. Use `Cloudflare.D1.QueryDatabase(Database)` or `SQL.D1` from `@alchemy.run/cloudflare/D1/SQL`.
   2. In `VideoRepo`, add `insert`, `findById`, `findByYoutubeId`, `setStatus`, `resetForRetry`, `markPublished` and `markFailed`.
   3. In `TranscriptRepo`, add `save` and `find`. `save` replaces an existing row.
-  4. In `RecapRepo`, add `save`, `find`, `setSegmentsStatus` and `saveSegments`. `save` replaces an existing row.
-  5. Use bound parameters in all queries. Do not put values into SQL text.
-  6. Return a typed `VideoNotFound` error when a row does not exist.
+  4. In `RecapRepo`, add `save`, `find`, `setSegmentsStatus`, `saveSegments` and `topHashtags(limit, excludeVideoId)`. `save` replaces an existing row.
+  5. Make `topHashtags` use the query in "Known hashtags".
+  6. Use bound parameters in all queries. Do not put values into SQL text.
+  7. Return a typed `VideoNotFound` error when a row does not exist.
 
-  Result: Each function has a test against local D1. A delete of a `videos` row also deletes its `transcripts` and `recaps` rows.
+  Result: Each function has a test against local D1. A delete of a `videos` row also deletes its `transcripts` and `recaps` rows. `topHashtags` sorts the tags by use count, does not count the excluded video and gives an empty list when `recaps` is empty.
 - [ ] **T11. Write the `AudioStore` service.** Needs: T04.
   1. Make `AudioStore` with `Cloudflare.R2.ReadWriteBucket(AudioBucket)`.
   2. Add `putChunk(videoId, n, stream, length)`. Use the key `audio/<videoId>/<n>.mp3` with three digits.
@@ -681,30 +737,34 @@ The MVP has 34 tasks in 6 phases. Each task is small enough for one pull request
   Result: The SRT of a 25-minute test file opens in VLC with no error. Its times agree with the audio within 1 second.
 - [ ] **T22. Write call A, the one-pass path.** Needs: T07, T21.
   1. In `src/lib/prompts.ts`, write the call A prompt and `PROMPT_VERSION = 1`.
-  2. Put generation rules 1, 2, 4, 5 and 7, the item counts and the JSON Schema of `ModelRecapOutput` in the system message.
-  3. Put the title, channel, description, `speakers`, language, `duration_sec` and the timestamped lines in the user message.
-  4. In `src/services/Recapper.ts`, call `ai.run(RECAP_MODEL, …)` with a temperature of 0.2 and 8000 output tokens or more. Use the request format on the model page of the Workers AI catalog.
-  5. Take the JSON object from the response text and decode it (check 1 in "Recap generation").
-  6. Run the call in a task with the name `recap-a`, with 2 retries.
+  2. In `src/lib/hashtags.ts`, write `HASHTAG_ALIASES` with the entries in "Hashtag aliases".
+  3. Put generation rules 1, 2, 4, 5, 7 and 8, the item counts and the JSON Schema of `ModelRecapOutput` in the system message.
+  4. Put the list of `HASHTAG_ALIASES` values in the system message.
+  5. In a task with the name `known-hashtags`, call `RecapRepo.topHashtags(50, videoId)`.
+  6. Put the title, channel, description, `speakers`, language, `duration_sec`, the known hashtags and the timestamped lines in the user message.
+  7. In `src/services/Recapper.ts`, call `ai.run(RECAP_MODEL, …)` with a temperature of 0.2 and 8000 output tokens or more. Use the request format on the model page of the Workers AI catalog.
+  8. Take the JSON object from the response text and decode it (check 1 in "Recap generation").
+  9. Run the call in a task with the name `recap-a`, with 2 retries.
 
-  Result: A 45-minute fixture and a 2-hour English fixture both decode on the one-pass path.
+  Result: A 45-minute fixture and a 2-hour English fixture both decode on the one-pass path. A prompt test shows the known hashtags when the list has items, and no list when it is empty.
 - [ ] **T23. Write call A, the long path.** Needs: T22.
   1. Estimate the input tokens as the number of characters divided by 3.
   2. If the estimate is more than 60,000, use the long path. Put the limit in a constant, so that a test can change it.
   3. Cut the timestamped lines into windows of 30,000 estimated tokens or fewer. Cut only between cues.
   4. Run one task `recap-map-<w>` for each window. Use the call A prompt with the text "part \<w> of \<total>".
-  5. Run one task `recap-reduce`. Give it the window outputs, not the transcript.
+  5. Run one task `recap-reduce`. Give it the window outputs and the known hashtags, not the transcript.
   6. Tell the reduce call to copy chapters, quotes and stats from the window outputs without change.
 
   Result: A test with a limit of 5,000 forces the long path on a 45-minute fixture. Its recap passes all checks of T24.
 - [ ] **T24. Check and save the recap.** Needs: T09, T22.
-  1. Write a pure function `finalizeRecap(output, cues, video, language)`. It does checks 2 to 8 in "Recap generation".
-  2. Make it return `VideoRecap` without `transcriptSegments`, and a list of the items it removed.
-  3. In a task with the name `save-recap`, save the recap with `RECAP_MODEL` and `PROMPT_VERSION`.
-  4. Log the number of removed items for each section. Do not log the transcript.
-  5. Set the status `publishing`.
+  1. Write a pure function `finalizeRecap(output, cues, video, language)`. It does checks 2 to 9 in "Recap generation".
+  2. In `src/lib/hashtags.ts`, write `normalizeHashtags(tags)` for check 9. `finalizeRecap` calls it.
+  3. Make it return `VideoRecap` without `transcriptSegments`, and a list of the items it removed.
+  4. In a task with the name `save-recap`, save the recap with `RECAP_MODEL` and `PROMPT_VERSION`.
+  5. Log the number of removed items for each section. Do not log the transcript.
+  6. Set the status `publishing`.
 
-  Result: Tests cover each check: chapter sort and end times, an invented quote, a quote with an incorrect time, an invented stat, a guessed speaker, duplicate topics and `featured: false`.
+  Result: Tests cover each check: chapter sort and end times, an invented quote, a quote with an incorrect time, an invented stat, a guessed speaker, duplicate topics, `featured: false`, and hashtags with `#`, capitals, spaces, duplicates or more than 7 items. A test shows that `database` and `db` in one recap give one `db` tag.
 - [ ] **T25. Write call B, the `TranscriptSegmentsJob` workflow.** Needs: T08, T09, T10.
   1. In `src/segmentsWorkflow.ts`, write `TranscriptSegmentsJob` with the input `{ videoId }`.
   2. In the task `segments-start`, set `segments_status` to `updating`.
@@ -718,7 +778,7 @@ The MVP has 34 tasks in 6 phases. Each task is small enough for one pull request
 - [ ] **T26. Write the `Telegram` service and the publish task.** Needs: T24.
   1. Read `TELEGRAM_BOT_TOKEN` with `Config.Redacted` and `TELEGRAM_CHAT_ID` with `Config.string`.
   2. In `src/lib/telegramFormat.ts`, make the HTML post as in "Telegram post". Use `formatTime` and `deepLink` for each chapter.
-  3. Make each topic a hashtag: replace spaces with `_` and remove other characters that are not letters or digits.
+  3. Put `#` before each item of `hashtags`. Put all hashtags on the last line of the post, with one space between them.
   4. Do not show a section that is in `hiddenSections` or that is empty.
   5. Escape `&`, `<` and `>` in all text from YouTube and from the model.
   6. Make sure that the post has 4096 characters or fewer. Remove chapters from the end, then takeaways from the end. Do not cut inside an HTML tag.
@@ -727,7 +787,7 @@ The MVP has 34 tasks in 6 phases. Each task is small enough for one pull request
 
   WARNING: Do not log the bot token. The token is part of the Telegram API URL.
 
-  Result: Tests cover escape, the 4096 limit, a hidden section, chapter links in `MM:SS` and in `HH:MM:SS`. A test post shows in a test channel.
+  Result: Tests cover escape, the 4096 limit, a hidden section, chapter links in `MM:SS` and in `HH:MM:SS`, and the hashtag line. A test post shows in a test channel.
 - [ ] **T27. Write the last pipeline tasks.** Needs: T25, T26.
   1. Write a task with the name `cleanup`. It calls `AudioStore.deleteAll(videoId)`.
   2. Set the status to `done` after the cleanup.
@@ -793,6 +853,7 @@ The MVP has 34 tasks in 6 phases. Each task is small enough for one pull request
   2. Write how to deploy the service and set the secrets.
   3. Add a link to the Postman procedure.
   4. Write how to change the API token, `RECAP_MODEL` and `SEGMENTS_MODEL`.
+  5. Write how to add an entry to `HASHTAG_ALIASES`.
 
   Result: A person with no knowledge of the project can deploy it and post one video.
 
