@@ -397,6 +397,42 @@ Call B cannot merge, change or summarize text, because it never returns text.
 
 The post is the only display in the MVP. It has, in this sequence: the title and the channel, `summary`, `keyTakeaways`, `chapters` with deep links, and `hashtags` on the last line, each with `#` before it (for example `#db #indexing`). The post does not show a section that is in `hiddenSections` or that is empty. The post has 4096 characters or fewer. To make it shorter, remove chapters from the end, then takeaways from the end.
 
+Format rules:
+
+1. Use Telegram HTML (`parse_mode: "HTML"`). It has no `<br>` and no list tags, so use a newline for each line break.
+2. Line 1 is the title in bold, with a link to the video. Line 2 is the channel in italics. If the channel is empty, do not show line 2.
+3. Put one empty line between two sections. Start the takeaways and the chapters with a bold heading: `Key takeaways`, `Chapters`.
+4. Start each takeaway with `• ` (a bullet and a space).
+5. Write each chapter as a time link, a space and the title. Use `formatTime` for the time and `deepLink` for the link.
+6. Escape `&`, `<` and `>` in all text from YouTube and from the model. Write `&` in each `href` value as `&amp;`.
+7. Put the hashtags on the last line, with one space between them.
+8. Send and edit with `link_preview_options: { is_disabled: true }`. Else Telegram shows a large preview card of one of the links.
+
+Example: the `telegram_text` of a 45-minute video.
+
+```html
+<b><a href="https://www.youtube.com/watch?v=dQw4w9WgXcQ">Postgres Indexing in Practice</a></b>
+<i>Hussein Nasser</i>
+
+The talk explains how Postgres chooses between index types and why a wrong index can make queries slower. You learn how to read EXPLAIN output and when a partial or covering index is the better choice.
+
+<b>Key takeaways</b>
+• A B-tree index helps only when the query filters on its leading columns.
+• Partial indexes cut index size when most rows never match the filter.
+• Check the real row counts in EXPLAIN ANALYZE, not only the estimates.
+
+<b>Chapters</b>
+<a href="https://www.youtube.com/watch?v=dQw4w9WgXcQ&amp;t=0s">00:00</a> Why indexes matter
+<a href="https://www.youtube.com/watch?v=dQw4w9WgXcQ&amp;t=312s">05:12</a> B-tree internals
+<a href="https://www.youtube.com/watch?v=dQw4w9WgXcQ&amp;t=1105s">18:25</a> Partial and covering indexes
+<a href="https://www.youtube.com/watch?v=dQw4w9WgXcQ&amp;t=1930s">32:10</a> Reading EXPLAIN ANALYZE
+<a href="https://www.youtube.com/watch?v=dQw4w9WgXcQ&amp;t=2410s">40:10</a> Q&amp;A
+
+#postgres #db #indexing #performance #sql
+```
+
+For a video of 1 hour or more, the chapter times have the form `HH:MM:SS`, for example `01:05:30`.
+
 The service saves the HTML text of the post in `videos.telegram_text`. After the first post, this column is the source of the post text. You can change it by hand (see "Post control").
 
 **Recap regeneration**
@@ -430,7 +466,7 @@ Two endpoints change a post that is already in the channel. Both call Telegram d
 
 Telegram has no "hide" for a channel post, and a bot can delete a post only in the first 48 hours. Thus "hidden" is an edit:
 
-- `hidden`: the service edits the post to a placeholder: the title in bold, then the line "This recap is hidden for a short time." The placeholder has no hashtags, so a search by tag does not find it.
+- `hidden`: the service edits the post to a placeholder: the title in bold, then the line "This recap is hidden for a short time." For example: `<b>Postgres Indexing in Practice</b>` and a newline, then the line. The placeholder has no hashtags, so a search by tag does not find it.
 - `visible`: the service edits the post back to `telegram_text`.
 - The post keeps its `message_id`, its links and its place in the channel. `telegram_text` does not change.
 
@@ -890,17 +926,17 @@ The MVP has 38 tasks in 6 phases. Each task is small enough for one pull request
   Result: The segment count is equal to `cue_count`. Each segment text is equal to its cue text. A forced failure sets `failed` and the video stays `done`.
 - [ ] **T26. Write the `Telegram` service and the publish task.** Needs: T24.
   1. Read `TELEGRAM_BOT_TOKEN` with `Config.Redacted` and `TELEGRAM_CHAT_ID` with `Config.string`.
-  2. In `src/lib/telegramFormat.ts`, make the HTML post as in "Telegram post". Use `formatTime` and `deepLink` for each chapter.
+  2. In `src/lib/telegramFormat.ts`, make the HTML post with the format rules in "Telegram post".
   3. Put `#` before each item of `hashtags`. Put all hashtags on the last line of the post, with one space between them.
   4. Do not show a section that is in `hiddenSections` or that is empty.
-  5. Escape `&`, `<` and `>` in all text from YouTube and from the model.
+  5. Escape `&`, `<` and `>` in all text from YouTube and from the model. Write `&` in each `href` as `&amp;`.
   6. Make sure that the post has 4096 characters or fewer. Remove chapters from the end, then takeaways from the end. Do not cut inside an HTML tag.
-  7. Send it with `sendMessage` and `parse_mode: "HTML"`. If Telegram returns `429`, wait for `parameters.retry_after` seconds and try again.
+  7. Send it with `sendMessage`, `parse_mode: "HTML"` and `link_preview_options: { is_disabled: true }`. If Telegram returns `429`, wait for `parameters.retry_after` seconds and try again.
   8. Save `message_id` and the post text with `markPublished`.
 
   WARNING: Do not log the bot token. The token is part of the Telegram API URL.
 
-  Result: Tests cover escape, the 4096 limit, a hidden section, chapter links in `MM:SS` and in `HH:MM:SS`, and the hashtag line. A test post shows in a test channel.
+  Result: A golden test gives the example post in "Telegram post" from its recap. Tests cover escape, `&amp;` in links, an empty channel, the 4096 limit, a hidden section, chapter links in `MM:SS` and in `HH:MM:SS`, and the hashtag line. A test post shows in a test channel with no link preview.
 - [ ] **T27. Write the last pipeline tasks.** Needs: T25, T26.
   1. Write a task with the name `cleanup`. It calls `AudioStore.deleteAll(videoId)`.
   2. Set the status to `done` after the cleanup.
@@ -924,7 +960,7 @@ The MVP has 38 tasks in 6 phases. Each task is small enough for one pull request
   4. In `save-recap`, copy `hiddenSections` from the old recap into the new recap.
   5. In the publish task, make the post text and save it with `setPostText`.
   6. If `telegram_visibility` is `hidden`, do not call Telegram. Go to the next task.
-  7. Else call `editMessageText` with `parse_mode: "HTML"` when `telegram_message_id` has a value. Else call `sendMessage`.
+  7. Else call `editMessageText` when `telegram_message_id` has a value. Else call `sendMessage`. Use the same options as in T26.
   8. Accept the Telegram error "message is not modified" as a success.
   9. On the Telegram error "message to edit not found", send a new post and save its `message_id`.
   10. Run `cleanup` and `start-segments` as in a full run.
@@ -942,7 +978,7 @@ The MVP has 38 tasks in 6 phases. Each task is small enough for one pull request
   Result: A request for a `done` video returns `202`, and the status goes back to `done` with a new recap. A second request during `recapping` gives `409`. A request for a video with status `uploading` gives `409`.
 - [ ] **T38. Write the post control handlers.** Needs: T36.
   1. In `src/lib/telegramFormat.ts`, write `hiddenPostText(video)`. It gives the title in bold and the line "This recap is hidden for a short time."
-  2. In the `Telegram` service, add `editPost(messageId, text)`. Map the Telegram errors as in "Post control".
+  2. In the `Telegram` service, add `editPost(messageId, text)` with the same options as in T26. Map the Telegram errors as in "Post control".
   3. Write the `POST /videos/:id/post/sync` handler. Apply the `409` rules in "Rules for each endpoint".
   4. In `sync`, edit the post to `telegram_text`. Then set `published_at`.
   5. Write the `PUT /videos/:id/post/visibility` handler. Decode the body with `Schema.Literal("visible", "hidden")`.
